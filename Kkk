@@ -1,0 +1,1478 @@
+-- language: Luau, file: matheus7z_suite.lua, target: MM2 Halloween via Delta
+-- fix: makeDraggable disparava onClick (bug do input.Changed bloqueando InputEnded)
+-- + fallback ScreenGui -> CoreGui or PlayerGui
+-- + keybind de backup (RightShift) pra abrir/fechar painel
+
+-- =====================================================================
+-- EXECUTOR CHECK
+-- =====================================================================
+local HAS_HOOKMETA = (typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function")
+if not HAS_HOOKMETA then warn("[matheus7z] hookmetamethod ausente — silent aim desativado") end
+
+-- =====================================================================
+-- BYPASS
+-- =====================================================================
+local Bypass = {}
+do
+    local session_start  = tick()
+    local WARMUP_SECONDS = 20
+    local warmup_done    = false
+    local tokens, MAX_TOKENS, REFILL_RATE = 12, 12, 10
+    local last_refill    = tick()
+    local flag_strikes, last_strike_time, backoff_until = 0, 0, 0
+    local last_pos_sample, last_pos_time = nil, tick()
+    local snapbacks = 0
+    local kill_events, kill_window_start, KILLED = 0, tick(), false
+
+    local function refill()
+        local now = tick()
+        tokens = math.min(MAX_TOKENS, tokens + (now - last_refill) * REFILL_RATE)
+        last_refill = now
+    end
+    function Bypass.consume(n)
+        refill(); n = n or 1
+        if tokens < n then task.wait((n - tokens) / REFILL_RATE + math.random() * 0.03); refill() end
+        tokens = tokens - n
+    end
+    function Bypass.is_killed() return KILLED end
+    function Bypass.is_warmup()
+        if warmup_done then return false end
+        if tick() - session_start >= WARMUP_SECONDS then warmup_done = true; return false end
+        return true
+    end
+    function Bypass.warmup_factor()
+        if not Bypass.is_warmup() then return 1.0 end
+        local p = (tick() - session_start) / WARMUP_SECONDS
+        return 0.5 + 0.5 * math.clamp(p, 0, 1)
+    end
+    function Bypass.paused() return KILLED or tick() < backoff_until end
+    function Bypass.pause(s, reason)
+        backoff_until = math.max(backoff_until, tick() + s)
+        if reason then warn("[bypass] backoff " .. string.format("%.1f", s) .. "s — " .. reason) end
+    end
+    function Bypass.register_strike(reason)
+        flag_strikes = flag_strikes + 1
+        last_strike_time = tick()
+        Bypass.pause(math.min(8, 1 + flag_strikes * 1.2), reason or ("strike " .. flag_strikes))
+        if flag_strikes >= 5 then
+            local now = tick()
+            if now - kill_window_start > 60 then kill_events, kill_window_start = 0, now end
+            kill_events = kill_events + 1
+            if kill_events >= 4 then KILLED = true; warn("[bypass] KILL SWITCH ativo") end
+        end
+    end
+    function Bypass.decay()
+        if tick() - last_strike_time > 30 and flag_strikes > 0 then
+            flag_strikes = flag_strikes - 1; last_strike_time = tick()
+        end
+    end
+    function Bypass.watchdog(root, on_flag)
+        if not root then return end
+        local now = tick()
+        if now - last_pos_time < 0.4 and last_pos_sample then
+            local d = (root.Position - last_pos_sample).Magnitude
+            if d > 0.1 and d < 1.0 then
+                snapbacks = snapbacks + 1
+                if snapbacks >= 3 then if on_flag then on_flag("snapback") end; snapbacks = 0 end
+            else snapbacks = 0 end
+        end
+        last_pos_sample, last_pos_time = root.Position, now
+    end
+    function Bypass.stealth_move(root, target_pos, opts)
+        if not root or Bypass.paused() then return false end
+        opts = opts or {}
+        local factor = Bypass.warmup_factor()
+        local max_step = math.max(4, math.floor((opts.step or 16) * factor))
+        local pace = opts.pace or 0.035
+        local start = root.Position
+        if (target_pos - start).Magnitude < 0.5 then return true end
+        local steps = math.min(math.ceil((target_pos - start).Magnitude / max_step), 25)
+        for i = 1, steps do
+            if Bypass.paused() then return false end
+            Bypass.consume(0.4)
+            root.CFrame = CFrame.new(start:Lerp(target_pos, i / steps))
+            task.wait((pace + math.random() * pace * 0.6) * (2 - factor))
+        end
+        return true
+    end
+    function Bypass.spoof_state(hum)
+        if not hum then return end
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+            hum:SetStateEnabled(Enum.HumanoidStateType.PlatformStanding, false)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+            local c = hum:GetState()
+            if c == Enum.HumanoidStateType.Physics
+            or c == Enum.HumanoidStateType.PlatformStanding
+            or c == Enum.HumanoidStateType.Ragdoll then
+                hum:ChangeState(hum:GetState() == Enum.HumanoidStateType.Freefall
+                    and Enum.HumanoidStateType.Freefall or Enum.HumanoidStateType.Running)
+            end
+        end)
+    end
+    function Bypass.stats()
+        return { strikes = flag_strikes, killed = KILLED, warmup = Bypass.is_warmup(), tokens = tokens }
+    end
+end
+
+-- =====================================================================
+-- SERVICES
+-- =====================================================================
+local CoreGui          = game:GetService("CoreGui")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer      = Players.LocalPlayer
+
+if CoreGui:FindFirstChild("Matheus7zPanel") then CoreGui.Matheus7zPanel:Destroy() end
+if LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("Matheus7zPanel") then
+    LocalPlayer.PlayerGui.Matheus7zPanel:Destroy()
+end
+
+-- =====================================================================
+-- THEME
+-- =====================================================================
+local THEME = {
+    bg            = Color3.fromRGB(10, 10, 12),
+    bg_transp     = 0.78,
+    bg_transp_bub = 0.72,
+    stroke_transp = 0.55,
+    text          = Color3.fromRGB(235, 235, 240),
+    text_dim      = Color3.fromRGB(140, 140, 150),
+    text_shadow   = Color3.fromRGB(0, 0, 0),
+    button_bg     = Color3.fromRGB(20, 20, 26),
+    button_transp = 0.35,
+    button_hover  = Color3.fromRGB(38, 38, 48),
+    toggle_on     = Color3.fromRGB(130, 255, 180),
+    toggle_off    = Color3.fromRGB(65, 65, 75),
+    divider       = Color3.fromRGB(255, 255, 255),
+    divider_tr    = 0.88,
+    close_bg      = Color3.fromRGB(50, 22, 30),
+    close_tr      = 0.4,
+    close_text    = Color3.fromRGB(255, 150, 150),
+    font          = Enum.Font.Arcade,
+    font_small    = Enum.Font.Arcade,
+}
+
+-- =====================================================================
+-- CONFIG
+-- =====================================================================
+local cfg = {
+    tween_speed = 21, tween_easing = Enum.EasingStyle.Linear,
+    touch_wait = 0.06, scan_wait = 0.06, idle_wait = 0.4,
+    bag_full = 45, tp_jitter = 0.6,
+    stealth_tp = true, stealth_step = 16, stealth_pace = 0.035,
+    fling_check = 0.25, watchdog_on = true,
+    stealth_collide = true, stealth_spoof = true,
+    autofling_dur = 10, fling_lin_vel = Vector3.new(380, 280, 380),
+    esp_murder = false, esp_sheriff = false, esp_innocent = false,
+    dropkick_enabled = true, dropkick_key = Enum.KeyCode.G,
+    dropkick_anim = "rbxassetid://125750702",
+    dropkick_boost = 100, window_duration = 0.6,
+    launch_up = 380, launch_out = 280, launch_hitbox = 6,
+    dropkick_emoji = "🦵💥", dropkick_cd = 2.5,
+    silent_aim = true, silent_sheriff = true, silent_murderer = true,
+    silent_hitbox = 12, silent_aim_head = true, silent_cd = 0.08,
+    silent_knife_teleport = true, silent_knife_range = 40,
+    tp_gun_auto = true, tp_gun_key = Enum.KeyCode.T, tp_gun_offset = 2,
+    tp_gun_cd = 1.5, tp_gun_watch = 0.25,
+}
+
+-- =====================================================================
+-- ESTADO
+-- =====================================================================
+local AutoCandyRunning, AntiFlingEnabled, AutoFlingAfterEnabled = false, false, false
+local isFlinging, lastFlingCheck, triggeredFling = false, 0, false
+local dropkick_last, dropkick_window, dropkick_hit = 0, false, {}
+local silent_last = 0
+local lastSheriff, sheriffHadGun, tp_gun_last, tp_gun_busy = nil, false, 0, false
+local aim_override_pos, aim_override_until = nil, 0
+local mouse = LocalPlayer:GetMouse()
+
+-- =====================================================================
+-- HELPERS
+-- =====================================================================
+local function get_root() local c = LocalPlayer.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function get_hum()  local c = LocalPlayer.Character; return c and c:FindFirstChildOfClass("Humanoid") end
+
+local function GetMurdererPlayer()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local c = p.Character
+            if (p:FindFirstChild("Backpack") and p.Backpack:FindFirstChild("Knife"))
+            or (c and c:FindFirstChild("Knife")) then return p end
+        end
+    end
+end
+local function GetSheriffPlayer()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local c = p.Character
+            if (p:FindFirstChild("Backpack") and p.Backpack:FindFirstChild("Gun"))
+            or (c and c:FindFirstChild("Gun")) then return p end
+        end
+    end
+end
+local function GetPlayerRole(p)
+    local c = p.Character
+    if not c then return "Innocent" end
+    if p:FindFirstChild("Backpack") and p.Backpack:FindFirstChild("Knife") then return "Murderer" end
+    if c:FindFirstChild("Knife") then return "Murderer" end
+    if p:FindFirstChild("Backpack") and p.Backpack:FindFirstChild("Gun") then return "Sheriff" end
+    if c:FindFirstChild("Gun") then return "Sheriff" end
+    return "Innocent"
+end
+
+-- =====================================================================
+-- SILENT AIM
+-- =====================================================================
+if HAS_HOOKMETA then
+    local old_index
+    old_index = hookmetamethod(game, "__index", function(self, key)
+        if self == mouse and key == "Hit" and aim_override_pos and tick() < aim_override_until then
+            return CFrame.new(aim_override_pos)
+        end
+        return old_index(self, key)
+    end)
+    local old_namecall
+    old_namecall = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if self == workspace and aim_override_pos and tick() < aim_override_until then
+            if method == "Raycast" then
+                local args = {...}
+                local origin = args[1]
+                if typeof(origin) == "Vector3" then
+                    args[2] = (aim_override_pos - origin).Unit * 2000
+                    return old_namecall(self, table.unpack(args))
+                elseif typeof(origin) == "Ray" then
+                    args[1] = Ray.new(origin.Origin, (aim_override_pos - origin.Origin).Unit * 2000)
+                    return old_namecall(self, table.unpack(args))
+                end
+            elseif method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList"
+            or method == "FindPartOnRayWithWhitelist" then
+                local args = {...}
+                local r = args[1]
+                if typeof(r) == "Ray" then
+                    args[1] = Ray.new(r.Origin, (aim_override_pos - r.Origin).Unit * 2000)
+                    return old_namecall(self, table.unpack(args))
+                end
+            end
+        end
+        return old_namecall(self, ...)
+    end)
+end
+
+local function arm_silent_override()
+    local myRole = GetPlayerRole(LocalPlayer)
+    local myRoot = get_root()
+    if not myRoot then return end
+    local target_part
+    if myRole == "Sheriff" and cfg.silent_sheriff then
+        local m = GetMurdererPlayer()
+        if m and m.Character then
+            local hum = m.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                target_part = m.Character:FindFirstChild(cfg.silent_aim_head and "Head" or "HumanoidRootPart")
+            end
+        end
+    elseif myRole == "Murderer" and cfg.silent_murderer then
+        local best, bestD = nil, cfg.silent_hitbox
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                local rp = p.Character:FindFirstChild("HumanoidRootPart")
+                if hum and hum.Health > 0 and rp then
+                    local d = (rp.Position - myRoot.Position).Magnitude
+                    if d < bestD then bestD = d; best = p.Character:FindFirstChild(cfg.silent_aim_head and "Head" or "HumanoidRootPart") end
+                end
+            end
+        end
+        target_part = best
+    end
+    if not target_part then return end
+    aim_override_pos = target_part.Position
+    aim_override_until = tick() + 0.15
+end
+
+local knife_busy = false
+local function silent_knife_kill()
+    if knife_busy or not cfg.silent_knife_teleport then return end
+    if GetPlayerRole(LocalPlayer) ~= "Murderer" then return end
+    local char = LocalPlayer.Character; if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool or tool.Name:lower() ~= "knife" then return end
+    local myRoot = get_root(); if not myRoot then return end
+    local best, bestD = nil, cfg.silent_knife_range
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            local rp = p.Character:FindFirstChild("HumanoidRootPart")
+            if hum and hum.Health > 0 and rp then
+                local d = (rp.Position - myRoot.Position).Magnitude
+                if d < bestD then bestD = d; best = { root = rp, char = p.Character } end
+            end
+        end
+    end
+    if not best then return end
+    knife_busy = true
+    local original_cf = myRoot.CFrame
+    task.spawn(function()
+        pcall(function()
+            myRoot.CFrame = best.root.CFrame * CFrame.new(0, 0, 1)
+            task.wait(0.06)
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    for _, tp in ipairs(best.char:GetDescendants()) do
+                        if tp:IsA("BasePart") then
+                            pcall(function() firetouchinterest(part, tp, 0) end)
+                            pcall(function() firetouchinterest(part, tp, 1) end)
+                        end
+                    end
+                end
+            end
+            task.wait(0.04)
+            myRoot.CFrame = original_cf
+        end)
+        task.wait(0.12)
+        knife_busy = false
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or Bypass.is_killed() then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if not cfg.silent_aim then return end
+    local now = tick()
+    if now - silent_last < cfg.silent_cd then return end
+    silent_last = now
+    local char = LocalPlayer.Character; if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool"); if not tool then return end
+    local role = GetPlayerRole(LocalPlayer)
+    if tool.Name:lower() == "gun" and role == "Sheriff" then
+        arm_silent_override()
+    elseif tool.Name:lower() == "knife" and role == "Murderer" then
+        silent_knife_kill()
+    end
+end)
+
+-- =====================================================================
+-- ANTI-FLING
+-- =====================================================================
+RunService.Heartbeat:Connect(function()
+    if Bypass.is_killed() then return end
+    if not AntiFlingEnabled and not AutoCandyRunning and not cfg.stealth_collide then return end
+    local now = tick()
+    if now - lastFlingCheck < cfg.fling_check then return end
+    lastFlingCheck = now
+    if AntiFlingEnabled or AutoCandyRunning then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                for _, part in ipairs(p.Character:GetDescendants()) do
+                    if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+                end
+            end
+        end
+    end
+    if (AutoCandyRunning or cfg.stealth_collide) and LocalPlayer.Character then
+        for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and math.random() < 0.6 then
+                pcall(function() part.CanCollide = false end)
+            end
+        end
+    end
+end)
+
+-- =====================================================================
+-- WATCHDOG
+-- =====================================================================
+task.spawn(function()
+    while not Bypass.is_killed() do
+        if cfg.watchdog_on then
+            local r = get_root()
+            if r then pcall(function() Bypass.watchdog(r, function(reason) Bypass.register_strike(reason) end) end) end
+        end
+        Bypass.decay()
+        task.wait(0.6)
+    end
+end)
+
+-- =====================================================================
+-- AUTO FLING
+-- =====================================================================
+local function TriggerAutoFling()
+    if isFlinging or not AutoFlingAfterEnabled or Bypass.is_killed() then return end
+    isFlinging = true
+    task.spawn(function()
+        local start = tick()
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if tick() - start >= cfg.autofling_dur or Bypass.is_killed() then
+                if conn then conn:Disconnect() end; isFlinging = false; return
+            end
+            if Bypass.paused() then return end
+            local murder = GetMurdererPlayer()
+            if murder and murder.Character then
+                local tr = murder.Character:FindFirstChild("HumanoidRootPart")
+                local mr = get_root()
+                if tr and mr then
+                    pcall(function() Bypass.stealth_move(mr, tr.Position, { step = 14, pace = 0.03 }) end)
+                    local bv = Instance.new("BodyVelocity")
+                    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+                    bv.Velocity = cfg.fling_lin_vel; bv.P = 5000; bv.Parent = mr
+                    task.delay(0.3, function() if bv and bv.Parent then bv:Destroy() end end)
+                end
+            end
+        end)
+    end)
+end
+
+local function hook_death(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if hum then hum.Died:Connect(function()
+        if AutoCandyRunning or AutoFlingAfterEnabled then TriggerAutoFling() end
+    end) end
+end
+LocalPlayer.CharacterAdded:Connect(hook_death)
+if LocalPlayer.Character then hook_death(LocalPlayer.Character) end
+
+-- =====================================================================
+-- ESP
+-- =====================================================================
+local function ApplyHighlight(p, role)
+    if not p.Character then return end
+    local hl = p.Character:FindFirstChild("MM2ESP")
+    local show, color = false, Color3.fromRGB(255, 255, 255)
+    if role == "Murderer" and cfg.esp_murder then show, color = true, Color3.fromRGB(255, 0, 0)
+    elseif role == "Sheriff" and cfg.esp_sheriff then show, color = true, Color3.fromRGB(0, 100, 255)
+    elseif role == "Innocent" and cfg.esp_innocent then show, color = true, Color3.fromRGB(0, 255, 0) end
+    if show then
+        if not hl then hl = Instance.new("Highlight"); hl.Name = "MM2ESP"; hl.Parent = p.Character end
+        hl.FillColor = color; hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+        hl.FillTransparency = 0.5; hl.OutlineTransparency = 0; hl.Enabled = true
+    elseif hl then hl.Enabled = false end
+end
+task.spawn(function()
+    while not Bypass.is_killed() do
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then pcall(function() ApplyHighlight(p, GetPlayerRole(p)) end) end
+        end
+        task.wait(0.7)
+    end
+end)
+
+-- =====================================================================
+-- AUTO CANDY
+-- =====================================================================
+local function IsRealCandy(part)
+    if not part or not part.Parent or not part:IsDescendantOf(workspace) then return false end
+    if part:IsA("BasePart") and (part.Transparency >= 1 or not part.CanTouch) then return false end
+    return true
+end
+
+local function TeleportToCandy(target)
+    local root = get_root()
+    if not root or not IsRealCandy(target) or Bypass.paused() then return end
+    local distance = (root.Position - target.Position).Magnitude
+    if distance < 0.5 then
+        pcall(function() firetouchinterest(root, target, 0) end)
+        task.wait(0.02)
+        pcall(function() firetouchinterest(root, target, 1) end)
+        return
+    end
+    local speed = math.max(1, cfg.tween_speed)
+    local time = distance / speed
+    local jitter = Vector3.new(
+        (math.random() - 0.5) * cfg.tp_jitter, 0,
+        (math.random() - 0.5) * cfg.tp_jitter)
+    local dest = CFrame.new(target.Position + jitter)
+    local tween = TweenService:Create(root, TweenInfo.new(time, cfg.tween_easing), { CFrame = dest })
+    tween:Play()
+    local start_time = tick()
+    while AutoCandyRunning and not Bypass.paused() do
+        if not IsRealCandy(target) then break end
+        if (root.Position - target.Position).Magnitude <= 0.3 then break end
+        if tick() - start_time > time + 2 then break end
+        task.wait()
+    end
+    pcall(function() tween:Cancel() end)
+    if IsRealCandy(target) then
+        pcall(function() firetouchinterest(root, target, 0) end)
+        task.wait(0.02)
+        pcall(function() firetouchinterest(root, target, 1) end)
+    end
+    if cfg.stealth_spoof then pcall(function() Bypass.spoof_state(get_hum()) end) end
+end
+
+local function GetClosestCandies()
+    local root = get_root(); if not root then return {} end
+    local list = {}
+    local container = workspace:FindFirstChild("Normal") or workspace
+    for _, obj in ipairs(container:GetDescendants()) do
+        local n = obj.Name:lower()
+        if n:find("candy") or n:find("coin") then
+            local part
+            if obj:IsA("BasePart") then part = obj
+            elseif obj:IsA("Model") then part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart") end
+            if IsRealCandy(part) then
+                table.insert(list, { Part = part, Distance = (root.Position - part.Position).Magnitude })
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.Distance < b.Distance end)
+    return list
+end
+
+local function CheckBagFull()
+    local full = false
+    pcall(function()
+        local ls = LocalPlayer:FindFirstChild("leaderstats")
+        if ls then
+            local stat = ls:FindFirstChild("Candies") or ls:FindFirstChild("Doces") or ls:FindFirstChild("Coins")
+            if stat and stat.Value >= cfg.bag_full then full = true end
+        end
+    end)
+    return full
+end
+
+task.spawn(function()
+    while not Bypass.is_killed() do
+        if AutoCandyRunning and not Bypass.paused() then
+            local full = CheckBagFull()
+            local candies = GetClosestCandies()
+            if full or #candies == 0 then
+                if not triggeredFling then triggeredFling = true; TriggerAutoFling() end
+            else
+                triggeredFling = false
+                local c = candies[1]
+                if c and IsRealCandy(c.Part) then TeleportToCandy(c.Part) end
+            end
+            task.wait(cfg.scan_wait)
+        else
+            triggeredFling = false
+            task.wait(cfg.idle_wait)
+        end
+    end
+end)
+
+-- =====================================================================
+-- DROP KICK
+-- =====================================================================
+local dropkick_anim = Instance.new("Animation")
+dropkick_anim.AnimationId = cfg.dropkick_anim
+
+local function spawn_emoji(part)
+    local bb = Instance.new("BillboardGui")
+    bb.Size = UDim2.new(6, 0, 3, 0); bb.StudsOffset = Vector3.new(0, 4, 0)
+    bb.Adornee = part; bb.AlwaysOnTop = true; bb.Parent = part
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0); lbl.BackgroundTransparency = 1
+    lbl.Text = cfg.dropkick_emoji; lbl.TextScaled = true
+    lbl.Font = Enum.Font.GothamBold; lbl.Parent = bb
+    task.delay(1.2, function() if bb then bb:Destroy() end end)
+end
+
+local function claim_owner(root)
+    pcall(function() if sethiddenproperty then sethiddenproperty(root, "NetworkOwnership", LocalPlayer) end end)
+    pcall(function() if syn and syn.set_network_owner then syn.set_network_owner(root, LocalPlayer) end end)
+    pcall(function() if setnetworkowner then setnetworkowner(root, LocalPlayer) end end)
+end
+
+local function launch(targetRoot, myRoot)
+    if not targetRoot or not myRoot or Bypass.paused() then return end
+    claim_owner(targetRoot)
+    local dir = (targetRoot.Position - myRoot.Position)
+    if dir.Magnitude < 0.1 then dir = myRoot.CFrame.LookVector end
+    dir = dir.Unit
+    local impulse = (dir * cfg.launch_out) + Vector3.new(0, cfg.launch_up, 0)
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Velocity = impulse; bv.P = 8000; bv.Parent = targetRoot
+    local tHum = targetRoot.Parent and targetRoot.Parent:FindFirstChildOfClass("Humanoid")
+    if tHum then
+        pcall(function()
+            tHum:SetStateEnabled(Enum.HumanoidStateType.PlatformStanding, false)
+            tHum:ChangeState(Enum.HumanoidStateType.Physics)
+        end)
+        task.delay(0.12, function() pcall(function() tHum:ChangeState(Enum.HumanoidStateType.Running) end) end)
+    end
+    spawn_emoji(targetRoot)
+    task.delay(0.5, function() if bv and bv.Parent then bv:Destroy() end end)
+end
+
+local function scan_window()
+    if not dropkick_window or Bypass.paused() then return end
+    local myRoot = get_root(); if not myRoot then return end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and not dropkick_hit[p.Character] then
+            local rp = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if rp and hum and hum.Health > 0 and (rp.Position - myRoot.Position).Magnitude <= cfg.launch_hitbox then
+                dropkick_hit[p.Character] = true
+                launch(rp, myRoot)
+            end
+        end
+    end
+end
+RunService.Heartbeat:Connect(scan_window)
+
+local function dropkick()
+    if not cfg.dropkick_enabled or Bypass.paused() then return end
+    local now = tick()
+    if now - dropkick_last < cfg.dropkick_cd then return end
+    dropkick_last = now
+    local myRoot, myHum = get_root(), get_hum()
+    if not myRoot or not myHum then return end
+    Bypass.consume(1); pcall(function() Bypass.spoof_state(myHum) end)
+    local anim = myHum:FindFirstChild("dropkick") or myHum:LoadAnimation(dropkick_anim)
+    anim:Play(0.05, 1, 1.5); anim.Name = "dropkick"
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Velocity = myRoot.CFrame.LookVector * math.min(cfg.dropkick_boost, 110)
+    bv.P = 6000; bv.Parent = myRoot
+    task.delay(0.22, function() if bv and bv.Parent then bv:Destroy() end end)
+    dropkick_window = true; dropkick_hit = {}
+    local char = LocalPlayer.Character
+    if char then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                local conn
+                conn = part.Touched:Connect(function(hit)
+                    if not dropkick_window or Bypass.paused() then return end
+                    local hc = hit:FindFirstAncestorOfClass("Model")
+                    if not hc or hc == LocalPlayer.Character then return end
+                    if Players:GetPlayerFromCharacter(hc) == nil or dropkick_hit[hc] then return end
+                    local rp = hc:FindFirstChild("HumanoidRootPart")
+                    local hum = hc:FindFirstChildOfClass("Humanoid")
+                    if rp and hum and hum.Health > 0 then
+                        dropkick_hit[hc] = true
+                        launch(rp, myRoot)
+                    end
+                end)
+                task.delay(cfg.window_duration + 0.1, function() conn:Disconnect() end)
+            end
+        end
+    end
+    task.delay(cfg.window_duration, function() dropkick_window = false; dropkick_hit = {} end)
+end
+
+-- =====================================================================
+-- TP GUN
+-- =====================================================================
+local function isInsidePlayer(obj)
+    local p = obj.Parent
+    while p and p ~= workspace do
+        if p:IsA("Backpack") then return true end
+        if p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function findDroppedGun()
+    local root = get_root()
+    local myPos = root and root.Position or Vector3.zero
+    local best, bestD = nil, math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Tool") and obj.Name:lower():find("gun") then
+            if not isInsidePlayer(obj) then
+                local handle = obj:FindFirstChild("Handle")
+                if handle then
+                    local d = (handle.Position - myPos).Magnitude
+                    if d < bestD then best, bestD = obj, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function teleportToGun(gun)
+    if not gun or not gun.Parent or Bypass.paused() then return end
+    local root = get_root(); if not root then return end
+    local handle = gun:FindFirstChild("Handle") or gun:FindFirstChildWhichIsA("BasePart")
+    if not handle then return end
+    local jitter = Vector3.new(
+        (math.random() - 0.5) * 0.3,
+        cfg.tp_gun_offset,
+        (math.random() - 0.5) * 0.3)
+    local dest = handle.Position + jitter
+    if cfg.stealth_tp then
+        pcall(function() Bypass.stealth_move(root, dest, { step = 15, pace = 0.045 }) end)
+    else
+        root.CFrame = CFrame.new(dest)
+    end
+    task.wait(0.05)
+    if gun.Parent then
+        pcall(function() firetouchinterest(root, handle, 0) end)
+        task.wait(0.02)
+        pcall(function() firetouchinterest(root, handle, 1) end)
+    end
+end
+
+task.spawn(function()
+    while not Bypass.is_killed() do
+        if cfg.tp_gun_auto and not Bypass.paused() then
+            local sheriff = GetSheriffPlayer()
+            local hasGun = sheriff ~= nil
+            if hasGun then sheriffHadGun = true; lastSheriff = sheriff end
+            if sheriffHadGun and not hasGun then
+                local now = tick()
+                if now - tp_gun_last >= cfg.tp_gun_cd and not tp_gun_busy then
+                    local gun = findDroppedGun()
+                    if gun then
+                        tp_gun_busy = true; tp_gun_last = now
+                        task.spawn(function()
+                            teleportToGun(gun)
+                            task.wait(0.4)
+                            tp_gun_busy = false
+                            sheriffHadGun = false
+                        end)
+                    end
+                end
+            end
+        end
+        task.wait(cfg.tp_gun_watch)
+    end
+end)
+
+workspace.DescendantAdded:Connect(function(obj)
+    if not cfg.tp_gun_auto or not obj:IsA("Tool") then return end
+    if not obj.Name:lower():find("gun") then return end
+    task.wait(0.1)
+    if isInsidePlayer(obj) or not obj.Parent then return end
+    local now = tick()
+    if now - tp_gun_last < cfg.tp_gun_cd or tp_gun_busy then return end
+    tp_gun_busy = true; tp_gun_last = now
+    task.spawn(function()
+        teleportToGun(obj)
+        task.wait(0.4)
+        tp_gun_busy = false
+    end)
+end)
+
+local hooked_sheriff = nil
+task.spawn(function()
+    while not Bypass.is_killed() do
+        local s = GetSheriffPlayer()
+        if s and s ~= hooked_sheriff then
+            hooked_sheriff = s
+            if s.Character then
+                local hum = s.Character:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    hum.Died:Connect(function()
+                        task.wait(0.2)
+                        local gun = findDroppedGun()
+                        if gun then teleportToGun(gun) end
+                    end)
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(2)
+    sheriffHadGun = false; lastSheriff = nil; hooked_sheriff = nil
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or Bypass.is_killed() then return end
+    if input.KeyCode == cfg.dropkick_key then dropkick() end
+    if input.KeyCode == cfg.tp_gun_key then
+        task.spawn(function() local gun = findDroppedGun(); if gun then teleportToGun(gun) end end)
+    end
+end)
+
+-- =====================================================================
+-- PAINEL
+-- =====================================================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Matheus7zPanel"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 999
+
+-- parent fallback: CoreGui primeiro, senão PlayerGui
+local parented = pcall(function() ScreenGui.Parent = CoreGui end)
+if not parented or not ScreenGui.Parent then
+    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- RGB
+local RGB = { targets = {}, hue = 0, speed = 0.15 }
+RunService.RenderStepped:Connect(function(dt)
+    RGB.hue = (RGB.hue + dt * RGB.speed) % 1
+    local c1 = Color3.fromHSV(RGB.hue, 0.85, 1)
+    local c2 = Color3.fromHSV((RGB.hue + 0.33) % 1, 0.85, 1)
+    local c3 = Color3.fromHSV((RGB.hue + 0.66) % 1, 0.85, 1)
+    for _, t in ipairs(RGB.targets) do
+        if t.gradient and t.gradient.Parent then
+            pcall(function()
+                t.gradient.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, c1),
+                    ColorSequenceKeypoint.new(0.5, c2),
+                    ColorSequenceKeypoint.new(1, c3),
+                })
+            end)
+        end
+        if t.stroke and t.stroke.Parent then
+            pcall(function() t.stroke.Color = c1 end)
+        end
+    end
+end)
+
+-- CORRIGIDO: drag detection sem input.Changed bloqueando InputEnded
+local function makeDraggable(container, handle, onClick)
+    handle = handle or container
+    local dragging = false
+    local moved = false
+    local dragStart, startPos
+    local THRESHOLD = 6
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = input.Position
+            startPos = container.Position
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            if math.abs(delta.X) > THRESHOLD or math.abs(delta.Y) > THRESHOLD then
+                moved = true
+            end
+            if moved then
+                container.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + delta.X,
+                    startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            local wasMoved = moved
+            dragging = false
+            moved = false
+            if not wasMoved and onClick then
+                task.spawn(onClick)
+            end
+        end
+    end)
+end
+
+local function addShadow(label, offset)
+    offset = offset or UDim2.new(0, 1, 0, 1)
+    local shadow = Instance.new("TextLabel")
+    shadow.Name = "Shadow"
+    shadow.Size = UDim2.new(1, offset.X.Offset, 1, offset.Y.Offset)
+    shadow.Position = UDim2.new(0, offset.X.Offset, 0, offset.Y.Offset)
+    shadow.BackgroundTransparency = 1
+    shadow.Text = label.Text
+    shadow.Font = label.Font
+    shadow.TextSize = label.TextSize
+    shadow.TextXAlignment = label.TextXAlignment
+    shadow.TextYAlignment = label.TextYAlignment
+    shadow.TextWrapped = label.TextWrapped
+    shadow.TextColor3 = THEME.text_shadow
+    shadow.ZIndex = math.max(0, label.ZIndex - 1)
+    shadow.Parent = label.Parent
+    label:GetPropertyChangedSignal("Text"):Connect(function()
+        shadow.Text = label.Text
+    end)
+    return shadow
+end
+
+-- BOLINHA
+local Bubble = Instance.new("TextButton")
+Bubble.Name = "Bubble"
+Bubble.Size = UDim2.new(0, 72, 0, 72)
+Bubble.Position = UDim2.new(0, 24, 0.5, -36)
+Bubble.BackgroundColor3 = THEME.bg
+Bubble.BackgroundTransparency = THEME.bg_transp_bub
+Bubble.Text = ""
+Bubble.AutoButtonColor = false
+Bubble.BorderSizePixel = 0
+Bubble.ZIndex = 50
+Bubble.Parent = ScreenGui
+
+local BubbleCorner = Instance.new("UICorner")
+BubbleCorner.CornerRadius = UDim.new(1, 0)
+BubbleCorner.Parent = Bubble
+
+local BubbleStroke = Instance.new("UIStroke")
+BubbleStroke.Thickness = 1.6
+BubbleStroke.Transparency = 0.4
+BubbleStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+BubbleStroke.Parent = Bubble
+
+local BubbleLabel = Instance.new("TextLabel")
+BubbleLabel.Size = UDim2.new(1, -8, 1, -8)
+BubbleLabel.Position = UDim2.new(0, 4, 0, 4)
+BubbleLabel.BackgroundTransparency = 1
+BubbleLabel.Text = "matheus7z"
+BubbleLabel.Font = THEME.font
+BubbleLabel.TextSize = 11
+BubbleLabel.TextColor3 = Color3.new(1, 1, 1)
+BubbleLabel.TextWrapped = true
+BubbleLabel.ZIndex = 51
+BubbleLabel.Parent = Bubble
+
+local BubbleGrad = Instance.new("UIGradient")
+BubbleGrad.Parent = BubbleLabel
+addShadow(BubbleLabel)
+table.insert(RGB.targets, { gradient = BubbleGrad, stroke = BubbleStroke })
+
+-- PAINEL
+local PANEL_W, PANEL_H = 400, 520
+
+local PanelFrame = Instance.new("Frame")
+PanelFrame.Name = "Panel"
+PanelFrame.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+PanelFrame.Position = UDim2.new(0.5, -PANEL_W/2, 0.5, -PANEL_H/2)
+PanelFrame.BackgroundColor3 = THEME.bg
+PanelFrame.BackgroundTransparency = THEME.bg_transp
+PanelFrame.BorderSizePixel = 0
+PanelFrame.Visible = false
+PanelFrame.ZIndex = 10
+PanelFrame.Parent = ScreenGui
+
+local PanelCorner = Instance.new("UICorner")
+PanelCorner.CornerRadius = UDim.new(0, 14)
+PanelCorner.Parent = PanelFrame
+
+local PanelStroke = Instance.new("UIStroke")
+PanelStroke.Thickness = 1.4
+PanelStroke.Transparency = THEME.stroke_transp
+PanelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+PanelStroke.Parent = PanelFrame
+
+local PanelBgGrad = Instance.new("UIGradient")
+PanelBgGrad.Rotation = 135
+PanelBgGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 16, 30)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(10, 10, 12)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(8, 8, 10)),
+})
+PanelBgGrad.Parent = PanelFrame
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, 0, 0, 64)
+TitleBar.BackgroundTransparency = 1
+TitleBar.ZIndex = 11
+TitleBar.Parent = PanelFrame
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -90, 0, 28)
+TitleLabel.Position = UDim2.new(0, 20, 0, 14)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "matheus7z"
+TitleLabel.Font = THEME.font
+TitleLabel.TextSize = 24
+TitleLabel.TextColor3 = Color3.new(1, 1, 1)
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.ZIndex = 12
+TitleLabel.Parent = TitleBar
+
+local TitleGrad = Instance.new("UIGradient")
+TitleGrad.Parent = TitleLabel
+table.insert(RGB.targets, { gradient = TitleGrad, stroke = PanelStroke })
+addShadow(TitleLabel, UDim2.new(0, 2, 0, 2))
+
+local SubLabel = Instance.new("TextLabel")
+SubLabel.Size = UDim2.new(1, -90, 0, 16)
+SubLabel.Position = UDim2.new(0, 20, 0, 42)
+SubLabel.BackgroundTransparency = 1
+SubLabel.Text = "v1.0  ·  mm2 suite"
+SubLabel.Font = THEME.font_small
+SubLabel.TextSize = 10
+SubLabel.TextColor3 = THEME.text_dim
+SubLabel.TextXAlignment = Enum.TextXAlignment.Left
+SubLabel.ZIndex = 12
+SubLabel.Parent = TitleBar
+addShadow(SubLabel)
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+CloseBtn.Position = UDim2.new(1, -40, 0, 18)
+CloseBtn.BackgroundColor3 = THEME.close_bg
+CloseBtn.BackgroundTransparency = THEME.close_tr
+CloseBtn.Text = "×"
+CloseBtn.Font = THEME.font
+CloseBtn.TextSize = 20
+CloseBtn.TextColor3 = THEME.close_text
+CloseBtn.AutoButtonColor = false
+CloseBtn.BorderSizePixel = 0
+CloseBtn.ZIndex = 13
+CloseBtn.Parent = TitleBar
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 8)
+CloseCorner.Parent = CloseBtn
+
+CloseBtn.MouseEnter:Connect(function()
+    TweenService:Create(CloseBtn, TweenInfo.new(0.15), {BackgroundTransparency = 0.1}):Play()
+end)
+CloseBtn.MouseLeave:Connect(function()
+    TweenService:Create(CloseBtn, TweenInfo.new(0.15), {BackgroundTransparency = THEME.close_tr}):Play()
+end)
+
+local Divider = Instance.new("Frame")
+Divider.Size = UDim2.new(1, -40, 0, 1)
+Divider.Position = UDim2.new(0, 20, 0, 68)
+Divider.BackgroundColor3 = THEME.divider
+Divider.BackgroundTransparency = THEME.divider_tr
+Divider.BorderSizePixel = 0
+Divider.ZIndex = 11
+Divider.Parent = PanelFrame
+
+local Content = Instance.new("ScrollingFrame")
+Content.Size = UDim2.new(1, -40, 1, -90)
+Content.Position = UDim2.new(0, 20, 0, 80)
+Content.BackgroundTransparency = 1
+Content.BorderSizePixel = 0
+Content.ScrollBarThickness = 4
+Content.ScrollBarImageColor3 = Color3.fromRGB(180, 100, 255)
+Content.ScrollBarImageTransparency = 0.4
+Content.CanvasSize = UDim2.new(0, 0, 0, 0)
+Content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Content.ScrollingDirection = Enum.ScrollingDirection.Y
+Content.ZIndex = 11
+Content.Parent = PanelFrame
+
+local ContentLayout = Instance.new("UIListLayout")
+ContentLayout.Padding = UDim.new(0, 8)
+ContentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ContentLayout.Parent = Content
+
+local ContentPad = Instance.new("UIPadding")
+ContentPad.PaddingBottom = UDim.new(0, 12)
+ContentPad.Parent = Content
+
+makeDraggable(PanelFrame, TitleBar)
+
+local panelOpen = false
+local function setPanelOpen(open)
+    panelOpen = open
+    if open then
+        PanelFrame.Visible = true
+        PanelFrame.Size = UDim2.new(0, PANEL_W, 0, 0)
+        TweenService:Create(PanelFrame,
+            TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Size = UDim2.new(0, PANEL_W, 0, PANEL_H) }):Play()
+    else
+        local tw = TweenService:Create(PanelFrame,
+            TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+            { Size = UDim2.new(0, PANEL_W, 0, 0) })
+        tw:Play()
+        tw.Completed:Connect(function()
+            if not panelOpen then PanelFrame.Visible = false end
+        end)
+    end
+end
+
+makeDraggable(Bubble, Bubble, function()
+    setPanelOpen(not panelOpen)
+end)
+
+CloseBtn.MouseButton1Click:Connect(function() setPanelOpen(false) end)
+
+-- backup: RightShift abre/fecha
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        setPanelOpen(not panelOpen)
+    end
+end)
+
+-- COMPONENTES
+local Panel = {}
+local next_order = 0
+local function order() next_order = next_order + 1; return next_order end
+
+function Panel:AddSection(title)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -4, 0, 22)
+    frame.BackgroundTransparency = 1
+    frame.LayoutOrder = order()
+    frame.Parent = Content
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = (title or "SECTION"):upper()
+    label.Font = THEME.font_small
+    label.TextSize = 10
+    label.TextColor3 = THEME.text_dim
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+    local line = Instance.new("Frame")
+    line.Size = UDim2.new(1, -8, 0, 1)
+    line.Position = UDim2.new(0, 8, 0, 16)
+    line.BackgroundColor3 = THEME.divider
+    line.BackgroundTransparency = 0.92
+    line.BorderSizePixel = 0
+    line.Parent = frame
+end
+
+function Panel:AddToggle(opts)
+    opts = opts or {}
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -8, 0, 54)
+    frame.BackgroundColor3 = THEME.button_bg
+    frame.BackgroundTransparency = THEME.button_transp
+    frame.BorderSizePixel = 0
+    frame.LayoutOrder = order()
+    frame.Parent = Content
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = frame
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.92
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = frame
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -70, 0, 22)
+    title.Position = UDim2.new(0, 14, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = opts.title or "Toggle"
+    title.Font = THEME.font
+    title.TextSize = 14
+    title.TextColor3 = THEME.text
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+    addShadow(title)
+    local desc = Instance.new("TextLabel")
+    desc.Size = UDim2.new(1, -70, 0, 14)
+    desc.Position = UDim2.new(0, 14, 0, 30)
+    desc.BackgroundTransparency = 1
+    desc.Text = opts.desc or ""
+    desc.Font = THEME.font_small
+    desc.TextSize = 10
+    desc.TextColor3 = THEME.text_dim
+    desc.TextXAlignment = Enum.TextXAlignment.Left
+    desc.Parent = frame
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(0, 36, 0, 18)
+    track.Position = UDim2.new(1, -50, 0.5, -9)
+    track.BackgroundColor3 = THEME.toggle_off
+    track.BorderSizePixel = 0
+    track.Parent = frame
+    local trackC = Instance.new("UICorner")
+    trackC.CornerRadius = UDim.new(1, 0)
+    trackC.Parent = track
+    local thumb = Instance.new("Frame")
+    thumb.Size = UDim2.new(0, 14, 0, 14)
+    thumb.Position = UDim2.new(0, 2, 0.5, -7)
+    thumb.BackgroundColor3 = Color3.new(1, 1, 1)
+    thumb.BorderSizePixel = 0
+    thumb.Parent = track
+    local thumbC = Instance.new("UICorner")
+    thumbC.CornerRadius = UDim.new(1, 0)
+    thumbC.Parent = thumb
+    local state = opts.default == true
+    local function apply(instant)
+        local targetColor = state and THEME.toggle_on or THEME.toggle_off
+        local targetPos = state and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        if instant then
+            track.BackgroundColor3 = targetColor
+            thumb.Position = targetPos
+        else
+            TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = targetColor }):Play()
+            TweenService:Create(thumb, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = targetPos }):Play()
+        end
+    end
+    apply(true)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.Parent = frame
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(frame, TweenInfo.new(0.12), { BackgroundColor3 = THEME.button_hover }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(frame, TweenInfo.new(0.12), { BackgroundColor3 = THEME.button_bg }):Play()
+    end)
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        apply(false)
+        if opts.callback then pcall(opts.callback, state) end
+    end)
+    return {
+        Set = function(v) state = v == true; apply(false) end,
+        Get = function() return state end,
+        Instance = frame,
+    }
+end
+
+function Panel:AddButton(opts)
+    opts = opts or {}
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 0, 42)
+    btn.BackgroundColor3 = THEME.button_bg
+    btn.BackgroundTransparency = THEME.button_transp
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.BorderSizePixel = 0
+    btn.LayoutOrder = order()
+    btn.Parent = Content
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = btn
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.92
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = btn
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -20, 1, 0)
+    label.Position = UDim2.new(0, 14, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.title or "Button"
+    label.Font = THEME.font
+    label.TextSize = 14
+    label.TextColor3 = THEME.text
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = btn
+    addShadow(label)
+    if opts.desc and opts.desc ~= "" then
+        btn.Size = UDim2.new(1, -8, 0, 52)
+        label.Size = UDim2.new(1, -20, 0, 22)
+        label.Position = UDim2.new(0, 14, 0, 8)
+        local desc = Instance.new("TextLabel")
+        desc.Size = UDim2.new(1, -20, 0, 14)
+        desc.Position = UDim2.new(0, 14, 0, 30)
+        desc.BackgroundTransparency = 1
+        desc.Text = opts.desc
+        desc.Font = THEME.font_small
+        desc.TextSize = 10
+        desc.TextColor3 = THEME.text_dim
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.Parent = btn
+    end
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = THEME.button_hover }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = THEME.button_bg }):Play()
+    end)
+    btn.MouseButton1Click:Connect(function()
+        if opts.callback then pcall(opts.callback) end
+    end)
+    return { Instance = btn }
+end
+
+function Panel:AddSlider(opts)
+    opts = opts or {}
+    local minV = opts.min or 0
+    local maxV = opts.max or 100
+    local valV = opts.default or minV
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -8, 0, 64)
+    frame.BackgroundColor3 = THEME.button_bg
+    frame.BackgroundTransparency = THEME.button_transp
+    frame.BorderSizePixel = 0
+    frame.LayoutOrder = order()
+    frame.Parent = Content
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = frame
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.92
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = frame
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -80, 0, 20)
+    title.Position = UDim2.new(0, 14, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = opts.title or "Slider"
+    title.Font = THEME.font
+    title.TextSize = 13
+    title.TextColor3 = THEME.text
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+    addShadow(title)
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Size = UDim2.new(0, 60, 0, 20)
+    valueLabel.Position = UDim2.new(1, -74, 0, 8)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = tostring(valV)
+    valueLabel.Font = THEME.font_small
+    valueLabel.TextSize = 12
+    valueLabel.TextColor3 = THEME.text
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Parent = frame
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -28, 0, 6)
+    bar.Position = UDim2.new(0, 14, 0, 42)
+    bar.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+    bar.BorderSizePixel = 0
+    bar.Parent = frame
+    local barC = Instance.new("UICorner")
+    barC.CornerRadius = UDim.new(1, 0)
+    barC.Parent = bar
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((valV - minV) / (maxV - minV), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(180, 100, 255)
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    local fillC = Instance.new("UICorner")
+    fillC.CornerRadius = UDim.new(1, 0)
+    fillC.Parent = fill
+    local fillStroke = Instance.new("UIStroke")
+    fillStroke.Thickness = 1
+    fillStroke.Transparency = 0.6
+    fillStroke.Parent = fill
+    table.insert(RGB.targets, { stroke = fillStroke })
+    local hit = Instance.new("TextButton")
+    hit.Size = UDim2.new(1, 0, 1, 0)
+    hit.BackgroundTransparency = 1
+    hit.Text = ""
+    hit.AutoButtonColor = false
+    hit.Parent = frame
+    local dragging = false
+    local function update_from_x(px)
+        local abs = bar.AbsolutePosition.X
+        local size = bar.AbsoluteSize.X
+        local rel = math.clamp((px - abs) / size, 0, 1)
+        local value = minV + (maxV - minV) * rel
+        value = math.floor(value + 0.5)
+        if value == valV then return end
+        valV = value
+        valueLabel.Text = tostring(valV)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        if opts.callback then pcall(opts.callback, valV) end
+    end
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update_from_x(input.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            update_from_x(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    return {
+        Set = function(v)
+            v = math.clamp(v, minV, maxV)
+            valV = v
+            valueLabel.Text = tostring(v)
+            fill.Size = UDim2.new((v - minV) / (maxV - minV), 0, 1, 0)
+        end,
+        Get = function() return valV end,
+        Instance = frame,
+    }
+end
+
+-- =====================================================================
+-- PLUGANDO NO PAINEL
+-- =====================================================================
+Panel:AddSection("Farm")
+Panel:AddToggle({ title = "Auto Candy (Tween)", desc = "Coleta candy/coin por tween + touch", default = false,
+    callback = function(v) AutoCandyRunning = v; AntiFlingEnabled = v end })
+Panel:AddToggle({ title = "Anti Fling", desc = "Desliga CanCollide dos outros", default = false,
+    callback = function(v) AntiFlingEnabled = v end })
+Panel:AddToggle({ title = "Auto Fling (Pós Candy / Morte)", desc = "Fling 10s no Murderer", default = false,
+    callback = function(v) AutoFlingAfterEnabled = v end })
+Panel:AddSlider({ title = "Velocidade do Tween (studs/s)", min = 5, max = 100, default = 21,
+    callback = function(v) cfg.tween_speed = v end })
+Panel:AddSlider({ title = "Bag Full", min = 20, max = 50, default = 45,
+    callback = function(v) cfg.bag_full = v end })
+
+Panel:AddSection("ESP")
+Panel:AddToggle({ title = "ESP Murderer", default = false, callback = function(v) cfg.esp_murder = v end })
+Panel:AddToggle({ title = "ESP Sheriff", default = false, callback = function(v) cfg.esp_sheriff = v end })
+Panel:AddToggle({ title = "ESP Innocent", default = false, callback = function(v) cfg.esp_innocent = v end })
+
+Panel:AddSection("Silent Aim")
+Panel:AddToggle({ title = "Silent Aim (Gun)", desc = "Hook mouse.Hit + Raycast", default = true,
+    callback = function(v) cfg.silent_aim = v end })
+Panel:AddToggle({ title = "Sheriff → Murderer", default = true, callback = function(v) cfg.silent_sheriff = v end })
+Panel:AddToggle({ title = "Murderer → Todos", default = true, callback = function(v) cfg.silent_murderer = v end })
+Panel:AddToggle({ title = "Silent Kill (Knife)", desc = "TP hit-back no alvo mais próximo", default = true,
+    callback = function(v) cfg.silent_knife_teleport = v end })
+Panel:AddToggle({ title = "Mira na Cabeça", default = true, callback = function(v) cfg.silent_aim_head = v end })
+Panel:AddSlider({ title = "Alcance Gun (studs)", min = 3, max = 60, default = 12,
+    callback = function(v) cfg.silent_hitbox = v end })
+Panel:AddSlider({ title = "Alcance Knife (studs)", min = 10, max = 200, default = 40,
+    callback = function(v) cfg.silent_knife_range = v end })
+Panel:AddSlider({ title = "Cooldown (0.01s)", min = 3, max = 50, default = 8,
+    callback = function(v) cfg.silent_cd = v / 100 end })
+
+Panel:AddSection("Drop Kick")
+Panel:AddToggle({ title = "Drop Kick", desc = "G ativa — arremessa quem encostar", default = true,
+    callback = function(v) cfg.dropkick_enabled = v end })
+Panel:AddSlider({ title = "Força Vertical", min = 100, max = 800, default = 380,
+    callback = function(v) cfg.launch_up = v end })
+Panel:AddSlider({ title = "Força Horizontal", min = 50, max = 800, default = 280,
+    callback = function(v) cfg.launch_out = v end })
+Panel:AddSlider({ title = "Cooldown (0.1s)", min = 10, max = 80, default = 25,
+    callback = function(v) cfg.dropkick_cd = v / 10 end })
+Panel:AddButton({ title = "Testar Drop Kick", desc = "Dispara agora", callback = function() dropkick() end })
+
+Panel:AddSection("TP Gun")
+Panel:AddToggle({ title = "TP Gun Auto", desc = "TP quando Sheriff dropa Gun", default = true,
+    callback = function(v) cfg.tp_gun_auto = v end })
+Panel:AddSlider({ title = "Offset (studs)", min = 0, max = 6, default = 2,
+    callback = function(v) cfg.tp_gun_offset = v end })
+Panel:AddSlider({ title = "Cooldown (0.5s)", min = 1, max = 20, default = 3,
+    callback = function(v) cfg.tp_gun_cd = v / 2 end })
+Panel:AddButton({ title = "TP Gun Agora", callback = function()
+    local gun = findDroppedGun()
+    if gun then teleportToGun(gun) else print("[tp gun] sem Gun dropada") end
+end })
+Panel:AddButton({ title = "Listar Guns", callback = function()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Tool") and obj.Name:lower():find("gun") then
+            print(string.format("[tp gun] %s | parent: %s | insidePlayer: %s",
+                obj:GetFullName(), obj.Parent and obj.Parent.Name or "nil", tostring(isInsidePlayer(obj))))
+        end
+    end
+end })
+
+Panel:AddSection("Bypass")
+Panel:AddToggle({ title = "Teleporte Stealth", default = true, callback = function(v) cfg.stealth_tp = v end })
+Panel:AddToggle({ title = "Humanoid State Spoof", default = true, callback = function(v) cfg.stealth_spoof = v end })
+Panel:AddToggle({ title = "CanCollide Flicker", default = true, callback = function(v) cfg.stealth_collide = v end })
+Panel:AddToggle({ title = "Watchdog (snapback)", default = true, callback = function(v) cfg.watchdog_on = v end })
+Panel:AddButton({ title = "Stats do Bypass", callback = function()
+    local s = Bypass.stats()
+    print(string.format("[bypass] strikes=%d killed=%s warmup=%s tokens=%.1f",
+        s.strikes, tostring(s.killed), tostring(s.warmup), s.tokens))
+end })
+Panel:AddButton({ title = "Pausa Manual 5s", callback = function() Bypass.pause(5, "manual") end })
+
+-- export
+Panel.Open   = function() setPanelOpen(true) end
+Panel.Close  = function() setPanelOpen(false) end
+Panel.Toggle = function() setPanelOpen(not panelOpen) end
+Panel.Destroy = function() ScreenGui:Destroy() end
+getgenv().matheus7z = Panel
+
+print("[matheus7z] suite carregada — clique na bolinha ou aperte RightShift pra abrir")
